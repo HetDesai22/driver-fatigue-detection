@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Model files (too large for GitHub)
+*.pt
+*.pth
+*.dat
+
+# Dataset (too large)
+dataset/
+
+# Temp files
+*.log
+*.cache
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
