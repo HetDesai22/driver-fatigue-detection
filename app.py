@@ -26,7 +26,13 @@ from PIL import Image, ImageTk
 FACE_MODEL_PATH = r"E:\driver-fatigue-detection\models\face_detector\train3\weights\best.pt"
 EYE_MODEL_PATH  = r"E:\driver-fatigue-detection\models\eye_classifier\eye_model.pth"
 ALARM_SOUND     = r"E:\driver-fatigue-detection\alarm.wav"
-CONSEC_FRAMES   = 15
+# EYES_CLOSED_ALERT_SECONDS is wall-clock time, not a frame count — a fixed frame threshold
+# (the old CONSEC_FRAMES=15 approach) takes longer in real seconds whenever actual camera FPS
+# drops (e.g. from the extra per-frame work added since: attention tracking, CARLA state sync,
+# more sidebar widgets), which made the beep/meter feel like it was "taking too long" even
+# though the frame count hadn't changed. Timing in seconds is predictable regardless of FPS,
+# same approach already used for distraction detection and the CARLA fatigue escalation.
+EYES_CLOSED_ALERT_SECONDS = 0.6
 DEVICE          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 LEFT_EYE_LANDMARKS  = [33, 160, 158, 133, 153, 144]
@@ -35,8 +41,8 @@ RIGHT_EYE_LANDMARKS = [362, 385, 387, 263, 373, 380]
 # ─────────────────────────────
 # CARLA VEHICLE RESPONSE CONFIG (additive)
 # A cumulative "strike" system: each SEPARATE drowsiness episode this session (i.e. each
-# time closed_frame_count crosses CONSEC_FRAMES and the beep fires — that existing alarm
-# logic is untouched) permanently escalates the vehicle's behavior, rather than only
+# time the eyes stay closed for EYES_CLOSED_ALERT_SECONDS and the beep fires — that existing
+# alarm logic is untouched) permanently escalates the vehicle's behavior, rather than only
 # reacting for as long as the eyes happen to stay closed. The car does not trust a driver
 # who's already been caught twice, even after they open their eyes again.
 #   Strike 1 -> reduced speed
@@ -866,6 +872,8 @@ class FatigueApp:
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self.show_face_mesh_var = tk.BooleanVar(value=True)
+
         # runtime state
         self.cap = None
         self.running = False
@@ -875,7 +883,7 @@ class FatigueApp:
         self.models_ready = False
         self.alarm_playing = False
 
-        self.closed_frame_count = 0
+        self.eyes_closed_since = None
         self.blink_count = 0
         self.alert_count = 0
         self.alarm_active = False
@@ -1023,6 +1031,14 @@ class FatigueApp:
         sidebar_canvas.bind("<MouseWheel>", _on_mousewheel)
         sidebar.bind("<MouseWheel>", _on_mousewheel)
 
+        mesh_row = tk.Frame(sidebar, bg=PANEL_BG)
+        mesh_row.pack(fill="x", padx=20, pady=(18, 4))
+        tk.Checkbutton(
+            mesh_row, text="Show face mesh dots (468 landmarks)", variable=self.show_face_mesh_var,
+            font=(FONT, 9), fg=TEXT, bg=PANEL_BG, activebackground=PANEL_BG,
+            selectcolor=CARD_BG, anchor="w",
+        ).pack(fill="x")
+
         tk.Label(sidebar, text="LIVE STATUS", font=(FONT, 10, "bold"), fg=SUBTEXT, bg=PANEL_BG).pack(
             anchor="w", padx=20, pady=(20, 6))
 
@@ -1043,7 +1059,7 @@ class FatigueApp:
         style.theme_use("clam")
         style.configure("meter.Horizontal.TProgressbar", troughcolor=CARD_BG, background=ACCENT, thickness=14)
         self.meter = ttk.Progressbar(sidebar, style="meter.Horizontal.TProgressbar",
-                                      maximum=CONSEC_FRAMES, length=260)
+                                      maximum=EYES_CLOSED_ALERT_SECONDS, length=260)
         self.meter.pack(padx=20, pady=(0, 20))
 
         self._sep(sidebar)
@@ -1209,7 +1225,7 @@ class FatigueApp:
             self.status_line.config(text="Could not access webcam (index 0).", fg=ALERT)
             return
 
-        self.closed_frame_count = 0
+        self.eyes_closed_since = None
         self.blink_count = 0
         self.alert_count = 0
         self.alarm_active = False
@@ -1252,7 +1268,7 @@ class FatigueApp:
         if not self.running:
             return
         self.fatigue_strikes = 0
-        self.closed_frame_count = 0
+        self.eyes_closed_since = None
         self._was_closed_seq = False
         self.alarm_active = False
         self._stop_alarm()
@@ -1331,6 +1347,19 @@ class FatigueApp:
         except Exception:
             return "open", 0.0
 
+    def _draw_face_mesh_dots(self, display, lm, w, h):
+        """Draws all 468 MediaPipe Face Mesh landmarks as small dots on the video feed.
+        These points are computed every frame regardless (they drive the eye-crop and
+        head-pose math) but were never actually rendered — this makes that visible.
+        The 6 points solvePnP uses for head pose are highlighted larger/brighter so
+        it's clear which ones matter for that calculation."""
+        for point in lm:
+            x, y = int(point.x * w), int(point.y * h)
+            cv2.circle(display, (x, y), 1, (0, 255, 210), -1)
+        for idx in HEAD_POSE_LANDMARK_IDS:
+            x, y = int(lm[idx].x * w), int(lm[idx].y * h)
+            cv2.circle(display, (x, y), 3, (0, 165, 255), -1)
+
     def _detect_face_crop(self, frame):
         """Runs the trained YOLO face detector (first real inference-time use of it in
         this app) to crop the largest detected face, returning a fixed-size grayscale
@@ -1377,6 +1406,10 @@ class FatigueApp:
         if mesh_results.multi_face_landmarks:
             for face_landmarks in mesh_results.multi_face_landmarks:
                 lm = face_landmarks.landmark
+
+                if self.show_face_mesh_var.get():
+                    self._draw_face_mesh_dots(display, lm, w, h)
+
                 left_eye_img, (lx1, ly1, lx2, ly2) = get_eye_roi(lm, LEFT_EYE_LANDMARKS, frame)
                 right_eye_img, (rx1, ry1, rx2, ry2) = get_eye_roi(lm, RIGHT_EYE_LANDMARKS, frame)
 
@@ -1393,17 +1426,21 @@ class FatigueApp:
         both_closed = any(l == "closed" and r == "closed" for l, r in eye_states)
 
         if both_closed:
-            self.closed_frame_count += 1
+            if self.eyes_closed_since is None:
+                self.eyes_closed_since = now
             self._was_closed_seq = True
         else:
-            if self._was_closed_seq and self.closed_frame_count < CONSEC_FRAMES:
-                self.blink_count += 1
-            self.closed_frame_count = 0
+            if self._was_closed_seq and self.eyes_closed_since is not None:
+                if now - self.eyes_closed_since < EYES_CLOSED_ALERT_SECONDS:
+                    self.blink_count += 1
+            self.eyes_closed_since = None
             self._was_closed_seq = False
             self.alarm_active = False
             self._stop_alarm()
 
-        if self.closed_frame_count >= CONSEC_FRAMES:
+        closed_duration = (now - self.eyes_closed_since) if self.eyes_closed_since is not None else 0.0
+
+        if closed_duration >= EYES_CLOSED_ALERT_SECONDS:
             if not self.alarm_active:
                 self.alarm_active = True
                 self.alert_count += 1
@@ -1471,7 +1508,7 @@ class FatigueApp:
 
         self._draw_attention_overlay(display, attention_status)
         self._render_frame(display)
-        self._update_sidebar(left_state, left_conf, right_state, right_conf)
+        self._update_sidebar(left_state, left_conf, right_state, right_conf, closed_duration)
         self._update_attention_sidebar(attention_status)
 
         # ── Vehicle response: real CARLA if reachable, local fallback otherwise.
@@ -1514,7 +1551,7 @@ class FatigueApp:
         self.video_label.configure(image=photo)
         self.video_label.image = photo
 
-    def _update_sidebar(self, left_state, left_conf, right_state, right_conf):
+    def _update_sidebar(self, left_state, left_conf, right_state, right_conf, closed_duration=0.0):
         if self.alarm_active:
             self.status_badge.config(text="DROWSY ALERT!", bg=ALERT, fg="#ffffff")
         else:
@@ -1527,7 +1564,7 @@ class FatigueApp:
             text=f"{right_state.upper()} ({right_conf:.2f})",
             fg=ALERT if right_state == "closed" else ACCENT)
 
-        self.meter["value"] = min(self.closed_frame_count, CONSEC_FRAMES)
+        self.meter["value"] = min(closed_duration, EYES_CLOSED_ALERT_SECONDS)
 
         elapsed = int(time.time() - self.session_start)
         mm, ss = divmod(elapsed, 60)
