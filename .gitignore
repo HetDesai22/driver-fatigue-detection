@@ -24,3 +24,9 @@ dataset/
 # Windows
 Thumbs.db
 desktop.ini
+
+*.pdf
+.pptx
+# CARLA simulator install (huge binary build, never commit)
+CARLA_0.9.16/
+CARLA_0.9.16.zip
